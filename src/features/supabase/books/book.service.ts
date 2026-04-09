@@ -3,99 +3,114 @@ import { db } from "@/lib/dexie"; // your Dexie IndexedDB setup
 import { v4 as uuidv4 } from "uuid";
 import { supabase } from "../index";
 import AuthAPI from "../auth/auth.service";
+import { Verified } from "lucide-react";
+import { COMMON_STATE_CONFIG_EXTENSIONS } from "@mdxeditor/editor";
 
-const BUCKET_NAME = process.env.NEXT_PUBLIC_SUPABASE_BUCKET_NAME!;
+const FILE_NAME = process.env.NEXT_PUBLIC_SUPABASE_BUCKET_FILE_NAME!;
+const IMAGE_NAME = process.env.NEXT_PUBLIC_SUPABASE_BUCKET_IMAGE_NAME!;
 
 async function uploadBook(
   title: string,
-  author: string, //origin
-  tags: string[], //verified
-  progress: number,
-  status: string[],
+  author: string,
+  tags: string[],
   isFavourite: boolean,
-  imageUrl: string,
-  note: string,
+  image: File | null,
   file: File,
   syncToCloud: boolean
 ) {
   const docId = uuidv4();
   const fileId = uuidv4();
+  let imageId: string | null = null;
+  if (image) imageId = uuidv4();
 
   const user = await AuthAPI.getCurrentUser();
   if (!user) {
     throw new Error("User not found");
   }
+
   const userId = user.id;
-  const verified = new Date().toISOString();
-  const version = new Date().toISOString();
+
   try {
     // Upload file to local IndexedDB
     await db.files.add({
       fileId,
       file,
-      
     });
+
+    //upload image to local indexdb
+    if (image) {
+      await db.image.add({
+        imageId,
+        image,
+      });
+    }
 
     // Upload metadata to local IndexedDB
     await db.metadata.add({
-      docId: docId,                           
-      title, 
+      docId: docId,
+      title,
       author,
       tags,
       fileId: fileId,
       userId: userId,
-      version,
-      progress,
-      status,
       isFavourite,
-      imageUrl: "", // url or what
-      verified,
-      origin,
-      note,
-
+      imageId,
     });
 
     if (syncToCloud) {
-      // Upload file to Supabase Storage
       const fileExtension = file.name.split(".").pop();
       const fileName = `${fileId}.${fileExtension}`;
+      let imageName: string | null = null;
 
+      // Upload file to Supabase Storage
       const { data: fileData, error: fileError } = await supabase.storage
-        .from(BUCKET_NAME)
+        .from(FILE_NAME)
         .upload(fileName, file, {
           cacheControl: "3600",
           upsert: false,
         });
-
       if (fileError) {
         throw new Error(`File upload failed: ${fileError.message}`);
+      }
+      if (image) {
+        const imageExtension = image.name.split(".").pop();
+        imageName = `${imageId}.${imageExtension}`;
+
+        // Upload file to Supabase Storage
+        const { data: imageData, error: imageError } = await supabase.storage
+          .from(IMAGE_NAME)
+          .upload(imageName, image, {
+            cacheControl: "3600",
+            upsert: false,
+          });
+        if (imageError) {
+          throw new Error(`image upload failed: ${imageError.message}`);
+        }
       }
 
       // Create metadata record in Supabase
       const { data: metadataData, error: metadataError } = await supabase
         .from("metadata")
         .insert({
-            id: docId,
-            title, 
-            author,
-            tags,
-            file_id: fileId,
-            userId: userId,
-            version,
-            progress, 
-            isFavourite,
-            imageUrl,
-            verified,
-            origin,
-            note,
-         
+          id: docId,
+          title,
+          author,
+          tags,
+          file_id: fileId,
+          user_id: userId,
+          isFavourite,
+          imageId,
+          Verified: true,
         })
         .select()
         .single();
 
       if (metadataError) {
         // If metadata creation fails, clean up the uploaded file
-        await supabase.storage.from(BUCKET_NAME).remove([fileName]);
+        await supabase.storage.from(FILE_NAME).remove([fileName]);
+        if (imageName) {
+          await supabase.storage.from(IMAGE_NAME).remove([imageName]);
+        }
         throw new Error(`Metadata creation failed: ${metadataError.message}`);
       }
 
@@ -112,7 +127,10 @@ async function uploadBook(
       if (permissionError) {
         // If permission creation fails, clean up metadata and file
         await supabase.from("metadata").delete().eq("id", docId);
-        await supabase.storage.from(BUCKET_NAME).remove([fileName]);
+        await supabase.storage.from(FILE_NAME).remove([fileName]);
+        if (imageName) {
+          await supabase.storage.from(IMAGE_NAME).remove([imageName]);
+        }
         throw new Error(
           `Permission creation failed: ${permissionError.message}`
         );
@@ -138,12 +156,11 @@ async function listCloudBooks() {
       throw new Error("User not found");
     }
     const userId = user.id;
-console.log({userId})
+    console.log({ userId });
     const { data, error } = await supabase
       .from("metadata")
       .select("*")
-      .eq("user_id", userId)
-      
+      .eq("user_id", userId);
 
     if (error) {
       throw new Error(`Failed to fetch books from cloud: ${error.message}`);
@@ -185,6 +202,57 @@ async function getlocalBook(fileId: string) {
   }
 }
 
+async function downloadBook(docId: string) {
+  const user = await AuthAPI.getCurrentUser();
+  if (!user) {
+    throw new Error("User not found");
+  }
+  const userId = user.id;
+
+  // Get the metadata to find the file
+  const { data: metadata, error: metadataError } = await supabase
+    .from("metadata")
+    .select("file_id, imageId")
+    .eq("id", docId)
+    .eq("user_id", userId) // Ensure user owns the book
+    .single();
+
+  if (metadataError || !metadata) {
+    throw new Error("Book not found or unauthorized");
+  }
+
+  // Download the file from storage
+  const { data: fileData, error: fileError } = await supabase.storage
+    .from(FILE_NAME)
+    .download(metadata.file_id);
+
+  if (fileError) {
+    throw new Error(`Failed to download book: ${fileError.message}`);
+  }
+
+  // store in indexdb
+  await db.files.add({
+    fileId: metadata.file_id,
+    file: fileData,
+  });
+
+  //download image form storage
+  if (!metadata.imageId) {
+    const { data: imageData, error: imageError } = await supabase.storage
+      .from(IMAGE_NAME)
+      .download(metadata.imageId);
+
+    if (imageError) {
+      throw new Error(`Failed to download book: ${imageError.message}`);
+    }
+  }
+  // store in indexdb
+  await db.image.add({
+    imageId: metadata.imageId,
+    image: fileData,
+  });
+}
+
 async function deleteBook(docId: string) {
   const {
     data: { user },
@@ -209,7 +277,7 @@ async function deleteBook(docId: string) {
   try {
     // Delete from storage
     const { error: storageError } = await supabase.storage
-      .from(BUCKET_NAME)
+      .from(FILE_NAME)
       .remove([`${metadata.file_id}`]);
 
     // Delete metadata
@@ -282,6 +350,7 @@ const BooksAPI = {
   listLocalBooks,
   listCloudBooks,
   getlocalBook,
+  downloadBook,
 };
 
 export default BooksAPI;
